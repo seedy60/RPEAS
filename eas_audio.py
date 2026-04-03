@@ -1,0 +1,186 @@
+import os
+import subprocess
+import re
+import numpy as np
+from pydub import AudioSegment
+from pydub.generators import Sine
+from EASGen import EASGen
+
+def clean_for_dectalk(text):
+    """
+    Cleans up NWS text so the older DECtalk/ScanSoft engine pronounces it correctly
+    and adds appropriate pauses.
+    """
+    # Replace NWS ellipses with commas for natural pauses
+    text = re.sub(r'\.\.\.+', ', ', text)
+    
+    # Expand common NWS abbreviations
+    # We must be careful with words that look like state abbreviations (e.g. IN, OR, ME) 
+    # if the text happens to be in ALL CAPS.
+    replacements = {
+        r'\bNWS\b': 'National Weather Service',
+        r'\bmph\b': 'miles per hour',
+        r'\bMPH\b': 'miles per hour',
+        # Timezones
+        r'\bEDT\b': 'Eastern Daylight Time',
+        r'\bEST\b': 'Eastern Standard Time',
+        r'\bCDT\b': 'Central Daylight Time',
+        r'\bCST\b': 'Central Standard Time',
+        r'\bMDT\b': 'Mountain Daylight Time',
+        r'\bMST\b': 'Mountain Standard Time',
+        r'\bPDT\b': 'Pacific Daylight Time',
+        r'\bPST\b': 'Pacific Standard Time',
+        r'\bAKDT\b': 'Alaska Daylight Time',
+        r'\bAKST\b': 'Alaska Standard Time',
+        r'\bHST\b': 'Hawaii Standard Time',
+        # Specific States requested / problematic
+        r'\bCO\b': 'Colorado',
+        r'\bHI\b': 'Hawaii',
+        r'\bTX\b': 'Texas',
+        r'\bFL\b': 'Florida',
+        r'\bOK\b': 'Oklahoma'
+    }
+    
+    # Do a case-sensitive replacement for the exact matches above
+    for pattern, replacement in replacements.items():
+        text = re.sub(pattern, replacement, text)
+        
+    return text
+
+def generate_radio_atmosphere(duration_ms, volume_db=-30):
+    """Generates a layer of white noise and low hum to simulate weather radio."""
+    # Generate white noise using numpy
+    sample_rate = 44100
+    n_samples = int(sample_rate * (duration_ms / 1000.0))
+    noise_data = np.random.uniform(-1, 1, n_samples).astype(np.float32)
+    
+    # Convert to 16-bit PCM for pydub
+    noise_data = (noise_data * 32767).astype(np.int16)
+    noise_segment = AudioSegment(
+        noise_data.tobytes(), 
+        frame_rate=sample_rate,
+        sample_width=2, 
+        channels=1
+    )
+    
+    # Generate a low 60Hz hum (electronic interference)
+    hum = Sine(60).to_audio_segment(duration=duration_ms).apply_gain(-40)
+    
+    # Combine and set base volume (very quiet background)
+    return (noise_segment.overlay(hum)).apply_gain(volume_db)
+
+def generate_mic_click():
+    """Generates a short radio 'key up' click."""
+    duration = 40
+    sample_rate = 44100
+    n_samples = int(sample_rate * (duration / 1000.0))
+    click_data = np.random.uniform(-1, 1, n_samples).astype(np.float32)
+    click_data = (click_data * 32767).astype(np.int16)
+    
+    click = AudioSegment(
+        click_data.tobytes(),
+        frame_rate=sample_rate,
+        sample_width=2,
+        channels=1
+    )
+    return click.apply_gain(-10) # Sharp but not deafening
+
+def apply_radio_filter(audio_segment):
+    """Overlays radio static and adds mic clicks to an audio segment."""
+    static = generate_radio_atmosphere(len(audio_segment))
+    click_in = generate_mic_click()
+    click_out = generate_mic_click()
+    
+    # Blend voice with static
+    filtered = audio_segment.overlay(static)
+    
+    # Add clicks at the very start and end
+    return click_in + filtered + click_out
+
+def _generate_tom(text, filename):
+    import uuid
+    abs_filename = os.path.abspath(filename)
+    cleaned_text = clean_for_dectalk(text)
+    
+    # We need to use 32-bit PowerShell because ScanSoft Tom is a 32-bit SAPI5 voice.
+    # Python is 64-bit, so it can't directly access the 32-bit registry keys for this voice.
+    
+    # Use a UUID to ensure this temporary script file is completely unique
+    # and won't be accidentally deleted by another async thread generating audio at the exact same millisecond.
+    unique_id = str(uuid.uuid4())[:8]
+    ps_script_path = os.path.join(os.path.dirname(abs_filename), f"temp_ps_{os.getpid()}_{unique_id}.ps1")
+    
+    # Create the PowerShell script that loads System.Speech and calls Tom
+    ps_script = f"""
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$synth.SetOutputToWaveFile('{abs_filename}')
+$synth.SelectVoice('ScanSoft Tom_Full_22kHz')
+$synth.Speak('{cleaned_text.replace("'", "''")}')
+$synth.Dispose()
+"""
+    with open(ps_script_path, "w", encoding="utf-8") as f:
+        f.write(ps_script)
+        
+    ps_exe = r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+    
+    try:
+        subprocess.run([ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_script_path], check=True)
+    finally:
+        if os.path.exists(ps_script_path):
+            os.remove(ps_script_path)
+
+def generate_eas_message(text, output_filename="alert.mp3", pre_speech=None):
+    print(f"Generating audio for text: {text}")
+    
+    # 1. SAME Header
+    header_text = "ZCZC-WXR-EAN-008043+0015-1231234-KDEN/NWS-"
+    header = EASGen.genHeader(header_text)
+    
+    # 2. Attention signal
+    attention = EASGen.genATTN(8)
+    
+    # 3. Voice message (with radio filter)
+    temp_tts_file = "temp_tts.wav"
+    _generate_tom(text, temp_tts_file)
+    voice_raw = AudioSegment.from_wav(temp_tts_file)
+    voice = apply_radio_filter(voice_raw)
+    
+    # 4. EOM
+    eom = EASGen.genEOM()
+    
+    # 5. Compile
+    silence_short = AudioSegment.silent(duration=500)
+    silence_long = AudioSegment.silent(duration=1000)
+    
+    final_audio = header + silence_short + attention + silence_long + voice + silence_long + eom
+    
+    # 6. Pre-speech (if any, like "Issued by owner")
+    if pre_speech:
+        temp_pre_file = "temp_pre.wav"
+        _generate_tom(pre_speech, temp_pre_file)
+        pre_voice = apply_radio_filter(AudioSegment.from_wav(temp_pre_file))
+        final_audio = pre_voice + silence_long + final_audio
+        if os.path.exists(temp_pre_file):
+            os.remove(temp_pre_file)
+    
+    final_audio.export(output_filename, format="mp3")
+    if os.path.exists(temp_tts_file):
+        os.remove(temp_tts_file)
+    return output_filename
+
+def generate_normal_speech(text, output_filename="speech.mp3"):
+    print(f"Generating normal speech for text: {text}")
+    temp_tts_file = "temp_tts_normal.wav"
+    _generate_tom(text, temp_tts_file)
+    voice_raw = AudioSegment.from_wav(temp_tts_file)
+    
+    # Apply the radio radio atmosphere
+    voice = apply_radio_filter(voice_raw)
+    
+    silence = AudioSegment.silent(duration=500)
+    final_audio = silence + voice + silence
+    final_audio.export(output_filename, format="mp3")
+    if os.path.exists(temp_tts_file):
+        os.remove(temp_tts_file)
+    return output_filename
