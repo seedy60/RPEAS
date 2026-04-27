@@ -1,33 +1,105 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import os
 import requests
 import asyncio
-import re
 import json
-import pytz
+import getpass
+import re
 import aiohttp
 from aiohttp import web
 import aiohttp_session
 from aiohttp_session.cookie_storage import EncryptedCookieStorage
-import base64
-from cryptography import fernet
 from urllib.parse import urlencode
 from dotenv import load_dotenv
-from eas_audio import generate_eas_message, generate_normal_speech
+from eas_audio import generate_eas_message, generate_normal_speech, list_installed_voices
 from datetime import datetime
 import sys
 
+try:
+    import nacl  # noqa: F401
+    VOICE_RUNTIME_READY = True
+    VOICE_RUNTIME_ERROR = ""
+except Exception as exc:
+    VOICE_RUNTIME_READY = False
+    VOICE_RUNTIME_ERROR = str(exc)
+
+
+def interactive_env_setup_if_missing():
+    """Creates a .env file via interactive prompts when it does not exist."""
+    env_path = ".env"
+    if os.path.exists(env_path):
+        return
+
+    print("No .env file detected. Starting interactive setup...")
+    print("Provide the required values for your Discord bot and dashboard OAuth.")
+
+    token = getpass.getpass("DISCORD_TOKEN: ").strip()
+    client_id = input("DISCORD_CLIENT_ID: ").strip()
+    client_secret = getpass.getpass("DISCORD_CLIENT_SECRET: ").strip()
+    owner_ids = input("BOT_OWNER_IDS (comma-separated Discord user IDs): ").strip()
+    default_redirect = "http://localhost:2424/callback"
+    redirect_uri = input(f"REDIRECT_URI [{default_redirect}]: ").strip() or default_redirect
+
+    env_contents = (
+        f"DISCORD_TOKEN={token}\n"
+        f"DISCORD_CLIENT_ID={client_id}\n"
+        f"DISCORD_CLIENT_SECRET={client_secret}\n"
+        f"BOT_OWNER_IDS={owner_ids}\n"
+        f"REDIRECT_URI={redirect_uri}\n"
+    )
+
+    with open(env_path, "w", encoding="utf-8") as env_file:
+        env_file.write(env_contents)
+
+    print(".env created successfully. Continuing startup...")
+
+
 # Load configuration from .env
+interactive_env_setup_if_missing()
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-BOT_VERSION = "1.0"
+BOT_VERSION = "2.0"
+DEFAULT_PREFIX = "fco!"
+LEGACY_PREFIXES = ["fco!", "vco!"]
+
+
+def parse_owner_id_set(raw_ids):
+    owner_set = set()
+    for item in (raw_ids or "").split(","):
+        cleaned = item.strip()
+        if cleaned.isdigit():
+            owner_set.add(cleaned)
+    return owner_set
+
+
+# Supports one or many owners. BOT_OWNER_IDS is the canonical setting.
+# Legacy BOT_OWNER_ID is still accepted as fallback.
+BOT_OWNER_IDS = parse_owner_id_set(os.getenv("BOT_OWNER_IDS"))
+legacy_owner = (os.getenv("BOT_OWNER_ID") or "").strip()
+if legacy_owner.isdigit():
+    BOT_OWNER_IDS.add(legacy_owner)
+
+
+def is_configured_owner_id(user_id):
+    return str(user_id) in BOT_OWNER_IDS
+
+
+async def configured_owner_check(ctx):
+    if is_configured_owner_id(ctx.author.id):
+        return True
+    raise commands.NotOwner()
+
+
+def configured_owner_only():
+    return commands.check(configured_owner_check)
 
 # JSON Database Setup
 DB_FILE = "servers.json"
 
 # Define the archive directory outside of the bot folder
 ARCHIVE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "alerts_archive"))
+WEATHER_SOUNDS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "weather_sounds"))
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -44,37 +116,169 @@ def save_db(data):
 
 servers_db = load_db()
 
+
+def get_guild_prefix(guild_id):
+    config = servers_db.get(str(guild_id), {})
+    return config.get("command_prefix", DEFAULT_PREFIX)
+
+
+async def get_prefix(bot_instance, message):
+    if message.guild:
+        guild_config = servers_db.get(str(message.guild.id), {})
+        custom_prefix = guild_config.get("command_prefix")
+        if custom_prefix:
+            prefixes = [custom_prefix]
+        else:
+            prefixes = LEGACY_PREFIXES
+    else:
+        prefixes = LEGACY_PREFIXES
+
+    # Remove duplicates while preserving order.
+    unique_prefixes = list(dict.fromkeys(prefixes))
+    return commands.when_mentioned_or(*unique_prefixes)(bot_instance, message)
+
 # Configure bot
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix='fco!', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+
+
+def get_voice_dependency_message():
+    return (
+        "Voice features are unavailable because the PyNaCl voice dependency is missing.\n"
+        "Install it in the same Python environment used to run the bot: `pip install PyNaCl`\n"
+        f"Details: {VOICE_RUNTIME_ERROR or 'PyNaCl not detected'}"
+    )
+
+
+async def ensure_voice_runtime(ctx):
+    if VOICE_RUNTIME_READY:
+        return True
+    await ctx.send(get_voice_dependency_message())
+    return False
+
+
+async def get_or_connect_voice_client(guild, config=None, fallback_channel=None):
+    """Returns a healthy connected voice client, reconnecting when stale/disconnected."""
+    config = config or {}
+    vc = guild.voice_client
+
+    if vc and not vc.is_connected():
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        vc = None
+
+    target_channel = fallback_channel
+    if not target_channel:
+        vc_id = config.get("voice_channel_id")
+        if vc_id:
+            target_channel = guild.get_channel(vc_id)
+
+    if not vc and not target_channel:
+        return None, "No configured voice channel. Run setup while connected to voice."
+
+    if target_channel:
+        perms = target_channel.permissions_for(guild.me)
+        if not perms.connect:
+            return None, f"I do not have Connect permission in {target_channel.mention}."
+        if not perms.speak:
+            return None, f"I do not have Speak permission in {target_channel.mention}."
+
+    try:
+        if vc and target_channel and vc.channel.id != target_channel.id:
+            await vc.move_to(target_channel)
+        elif not vc and target_channel:
+            vc = await target_channel.connect(self_deaf=True, reconnect=True, timeout=20.0)
+
+        # If connected to a Stage Channel, unsuppress so audio can be heard.
+        if vc and isinstance(vc.channel, discord.StageChannel):
+            try:
+                await guild.me.edit(suppress=False)
+            except Exception:
+                # If missing permissions, playback may still be inaudible. Caller gets normal VC.
+                pass
+    except Exception as e:
+        return None, f"Failed to connect to voice: {e}"
+
+    return vc, None
+
+
+async def play_audio_file(vc, file_path):
+    """Plays audio on an existing voice client and returns an error string on failure."""
+    if not os.path.exists(file_path):
+        return f"Audio file not found: {file_path}"
+    if os.path.getsize(file_path) <= 0:
+        return f"Audio file is empty: {file_path}"
+
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+
+    # FFmpegOpusAudio avoids local opus-library dependency issues that can cause silent playback.
+    try:
+        source = discord.FFmpegOpusAudio(file_path)
+        vc.play(source, after=lambda err: print(f"Playback error: {err}") if err else None)
+    except Exception as e:
+        return f"Failed to start playback: {e}"
+
+    return None
 
 # --- State Variables ---
-seen_alerts = set()
-active_alerts_cache = {} # Dict of zone -> list of alerts
-alert_history = {}       # Dict of zone -> list of alerts
+alert_history = {}  # Dict of guild_id -> list of alerts
 
-# Life-Threatening Alerts that will trigger a @everyone ping
-URGENT_EVENTS = [
-    "Tornado Warning",
-    "Flash Flood Warning",
-    "Severe Thunderstorm Warning",
-    "Tsunami Warning",
-    "Civil Emergency Message",
-    "Evacuation Immediate",
-    "Shelter in Place Warning",
-    "AMBER Alert",
-    "Nuclear Power Plant Warning",
-    "Hazardous Materials Warning",
-    "Fire Warning"
-]
+UK_WEATHER_CODE_MAP = {
+    0: "clear skies",
+    1: "mainly clear",
+    2: "partly cloudy",
+    3: "overcast",
+    45: "fog",
+    48: "depositing rime fog",
+    51: "light drizzle",
+    53: "drizzle",
+    55: "dense drizzle",
+    56: "light freezing drizzle",
+    57: "freezing drizzle",
+    61: "light rain",
+    63: "rain",
+    65: "heavy rain",
+    66: "light freezing rain",
+    67: "freezing rain",
+    71: "light snowfall",
+    73: "snowfall",
+    75: "heavy snowfall",
+    77: "snow grains",
+    80: "rain showers",
+    81: "heavier rain showers",
+    82: "violent rain showers",
+    85: "snow showers",
+    86: "heavy snow showers",
+    95: "thunderstorm",
+    96: "thunderstorm with slight hail",
+    99: "thunderstorm with hail"
+}
+
+
+def get_wind_unit(guild_id):
+    config = servers_db.get(str(guild_id), {})
+    return config.get("wind_unit", "kph")
+
+
+def convert_wind_speed(value_kph, unit):
+    if value_kph in [None, "?"]:
+        return "?"
+    try:
+        speed = float(value_kph)
+    except (TypeError, ValueError):
+        return "?"
+
+    if unit == "mph":
+        return round(speed * 0.621371, 1)
+    return round(speed, 1)
 
 # --- Web Server (ENDEC Dashboard) ---
-
-# Replace with your actual Discord User ID
-BOT_OWNER_ID = "1365401272798281850"
 
 # aiohttp_session EncryptedCookieStorage requires exactly 32 raw bytes.
 WEB_SESSION_KEY = os.urandom(32)
@@ -82,11 +286,19 @@ WEB_SESSION_KEY = os.urandom(32)
 async def discord_login(request):
     """Redirects the user to Discord's OAuth2 login page."""
     client_id = os.getenv("DISCORD_CLIENT_ID")
-    redirect_uri = os.getenv("REDIRECT_URI")
+    redirect_uri = (os.getenv("REDIRECT_URI") or "").strip()
     if not client_id or not redirect_uri:
         return web.Response(status=500, text="OAuth2 not configured in .env file.")
-        
-    oauth_url = f"https://discord.com/api/oauth2/authorize?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope=identify"
+
+    oauth_query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "identify",
+        }
+    )
+    oauth_url = f"https://discord.com/api/oauth2/authorize?{oauth_query}"
     raise web.HTTPFound(oauth_url)
 
 async def discord_callback(request):
@@ -97,7 +309,7 @@ async def discord_callback(request):
         
     client_id = os.getenv("DISCORD_CLIENT_ID")
     client_secret = os.getenv("DISCORD_CLIENT_SECRET")
-    redirect_uri = os.getenv("REDIRECT_URI")
+    redirect_uri = (os.getenv("REDIRECT_URI") or "").strip()
     
     token_url = "https://discord.com/api/oauth2/token"
     data = {
@@ -124,7 +336,7 @@ async def discord_callback(request):
             user_data = await resp.json()
             user_id = user_data.get("id")
             
-    if user_id != BOT_OWNER_ID:
+    if not is_configured_owner_id(user_id):
         return web.Response(status=403, text="Forbidden: You are not the authorized Bot Owner.")
         
     web_session = await aiohttp_session.get_session(request)
@@ -194,7 +406,7 @@ async def web_index(request):
                 <p><strong>Connection:</strong> ONLINE</p>
                 <p><strong>Latency:</strong> {round(bot.latency * 1000)}ms</p>
                 <p><strong>Connected Servers:</strong> {len(servers_db)}</p>
-                <p><strong>API Polling:</strong> {'Active' if check_nws_alerts.is_running() else 'Inactive'}</p>
+                <p><strong>Alert Mode:</strong> Manual RP Alerts</p>
             </section>
             <section class="panel" aria-labelledby="controls">
                 <h2 id="controls">Manual Trigger Controls</h2>
@@ -203,9 +415,6 @@ async def web_index(request):
                 </form>
                 <form action="/stop" method="post" style="display:inline;">
                     <button type="submit" class="btn">Stop All Audio</button>
-                </form>
-                <form action="/poll" method="post" style="display:inline;">
-                    <button type="submit" class="btn">Force API Poll</button>
                 </form>
             </section>
             <section class="panel" aria-labelledby="archive">
@@ -237,14 +446,7 @@ async def trigger_global_test(trigger_source="Web ENDEC UI"):
         for guild_id_str, config in servers_db.items():
             guild = bot.get_guild(int(guild_id_str))
             if not guild: continue
-            vc = guild.voice_client
-            if not vc or not vc.is_connected():
-                vc_id = config.get("voice_channel_id")
-                if vc_id:
-                    channel = guild.get_channel(vc_id)
-                    if channel:
-                        try: vc = await channel.connect(self_deaf=True)
-                        except: continue
+            vc, _ = await get_or_connect_voice_client(guild, config)
             if not vc or not vc.is_connected() or vc.is_playing(): continue
             guild_filename = f"{ARCHIVE_DIR}/global_test_{guild.id}_{timestamp}.mp3"
             shutil.copy(base_filename, guild_filename)
@@ -252,11 +454,13 @@ async def trigger_global_test(trigger_source="Web ENDEC UI"):
             if text_id:
                 text_channel = guild.get_channel(text_id)
                 if text_channel:
-                    embed = discord.Embed(title="🚨 Global Test Alert", description=f"**Location:** {config.get('place_name', 'All Zones')}\n**Issued By:** {trigger_source}", color=discord.Color.blue())
+                    embed = discord.Embed(title="🚨 Global Test Alert", description=f"**Location:** {config.get('uk_location', 'All Zones')}\n**Issued By:** {trigger_source}", color=discord.Color.blue())
                     embed.add_field(name="Headline", value="This is a global test of the Emergency Alert System.", inline=False)
                     embed.add_field(name="Details", value=main_text, inline=False)
                     bot.loop.create_task(text_channel.send(content="🚨 **GLOBAL TEST ALERT** 🚨", embed=embed))
-            vc.play(discord.FFmpegPCMAudio(source=guild_filename))
+            play_err = await play_audio_file(vc, guild_filename)
+            if play_err:
+                print(f"Global test playback skipped in guild {guild.id}: {play_err}")
     except Exception as e:
         print(f"Error during web-triggered global test: {e}")
 
@@ -270,7 +474,7 @@ async def web_stop_audio(request):
     return web.HTTPFound('/')
 
 async def web_force_poll(request):
-    bot.loop.create_task(check_nws_alerts())
+    # Auto alerts are intentionally disabled in RP mode.
     return web.HTTPFound('/')
 
 async def start_web_server():
@@ -301,9 +505,16 @@ async def start_web_server():
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
+    if not BOT_OWNER_IDS:
+        print("WARNING: BOT_OWNER_IDS is empty. Owner-only commands and web owner auth will deny everyone.")
+    if not VOICE_RUNTIME_READY:
+        print(f"Voice support disabled: {get_voice_dependency_message()}")
     if not os.path.exists(ARCHIVE_DIR):
         os.makedirs(ARCHIVE_DIR)
         print(f"Created archive folder at {ARCHIVE_DIR}")
+    if not os.path.exists(WEATHER_SOUNDS_DIR):
+        os.makedirs(WEATHER_SOUNDS_DIR)
+        print(f"Created weather sounds folder at {WEATHER_SOUNDS_DIR}")
     bot.loop.create_task(start_web_server())
     for guild_id_str, config in servers_db.items():
         vc_id = config.get("voice_channel_id")
@@ -312,8 +523,6 @@ async def on_ready():
             if channel and isinstance(channel, discord.VoiceChannel):
                 try: await channel.connect(self_deaf=True)
                 except Exception as e: print(f"Failed to auto-join VC {vc_id}: {e}")
-    if not check_nws_alerts.is_running():
-        check_nws_alerts.start()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -328,62 +537,96 @@ async def on_command_error(ctx, error):
             missing = ", ".join(error.missing_permissions)
             await ctx.author.send(f"❌ {ctx.author.mention}, you do not have permission to use the `{ctx.command.name}` command. Error: Missing permissions ({missing}).")
         except: pass
-    elif isinstance(error, commands.CommandNotFound): pass
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    elif isinstance(error, RuntimeError) and "library needed in order to use voice" in str(error).lower():
+        await ctx.send(get_voice_dependency_message())
     else: print(f"Command error in {ctx.command}: {error}")
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.guild:
+        current_prefix = get_guild_prefix(message.guild.id)
+        content = message.content.strip()
+
+        # If user appears to call a known command with the wrong prefix,
+        # provide a hint instead of failing silently.
+        m = re.match(r"^(\S{1,6}!)([A-Za-z0-9_]+)\b", content)
+        if m:
+            used_prefix = m.group(1)
+            command_name = m.group(2).lower()
+            known_command = bot.get_command(command_name)
+
+            if known_command and used_prefix != current_prefix:
+                await message.channel.send(
+                    f"Unknown prefix `{used_prefix}`. Current prefix for this server is `{current_prefix}`. Try `{current_prefix}{command_name}`."
+                )
+
+    await bot.process_commands(message)
 
 @bot.command()
 async def help(ctx):
-    embed = discord.Embed(title="📡 EAS Bot Help & Commands", description=f"A professional Emergency Alert System (EAS) relay bot. **Version {BOT_VERSION}**", color=discord.Color.blue())
-    embed.add_field(name="🎙️ General Commands", value="`fco!join`, `fco!leave`, `fco!active`, `fco!history`, `fco!weather [ZIP]`, `fco!stop`, `fco!status`", inline=False)
-    embed.add_field(name="⚙️ Admin Commands", value="`fco!setup <ZIP>`, `fco!test`", inline=False)
-    if await bot.is_owner(ctx.author):
-        embed.add_field(name="👑 Owner Commands", value="`fco!testg`, `fco!pipe`, `fco!serverslist`, `fco!freshpull`, `fco!restart`, `fco!shutdown`, `fco!getlogs`", inline=False)
+    prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
+    embed = discord.Embed(title="📡 RP EAS Bot Help & Commands", description=f"Manual RP alert bot with selectable voices and UK forecasts. **Version {BOT_VERSION}**", color=discord.Color.blue())
+    embed.add_field(name="🎙️ General Commands", value=f"`{prefix}join`, `{prefix}leave`, `{prefix}active`, `{prefix}history`, `{prefix}weather [UK location] [--sounds]`, `{prefix}voices`, `{prefix}voice`, `{prefix}prefix`, `{prefix}windunit`, `{prefix}weathersounds`, `{prefix}stop`, `{prefix}status`", inline=False)
+    embed.add_field(name="⚙️ Admin Commands", value=f"`{prefix}setup [default UK location]`, `{prefix}setvoice <voice name>`, `{prefix}setprefix <new prefix>`, `{prefix}setwindunit <mph|kph>`, `{prefix}setweatherintro` (attach file), `{prefix}setweatheroutro` (attach file), `{prefix}clearweathersounds`, `{prefix}customalert <event | message | area(optional) | severity(optional)>`, `{prefix}test`", inline=False)
+    if is_configured_owner_id(ctx.author.id):
+        embed.add_field(name="👑 Owner Commands", value=f"`{prefix}testg`, `{prefix}pipe`, `{prefix}serverslist`, `{prefix}restart`, `{prefix}shutdown`, `{prefix}getlogs`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setup(ctx, zip_code: str = None):
-    if not zip_code or not zip_code.isdigit() or len(zip_code) != 5:
-        await ctx.send("Please provide a valid 5-digit US ZIP Code. Example: `fco!setup 81240`")
+async def setup(ctx, *, default_uk_location: str = None):
+    if not await ensure_voice_runtime(ctx):
         return
-    await ctx.send(f"🔍 Looking up zone information for ZIP Code {zip_code}...")
-    headers = {"User-Agent": "EASDiscordBot/1.0"}
-    try:
-        zip_res = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=10)
-        if zip_res.status_code != 200:
-            await ctx.send("❌ Could not find that ZIP Code.")
-            return
-        zip_data = zip_res.json()
-        lat, lon = zip_data['places'][0]['latitude'], zip_data['places'][0]['longitude']
-        place_name = f"{zip_data['places'][0]['place name']}, {zip_data['places'][0]['state abbreviation']}"
-        points_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers, timeout=10)
-        if points_res.status_code != 200:
-            await ctx.send("❌ Failed to contact NWS API.")
-            return
-        points_data = points_res.json()
-        county_url = points_data.get('properties', {}).get('county')
-        if not county_url:
-            await ctx.send("❌ Could not determine NWS Zone.")
-            return
-        zone_id = county_url.split('/')[-1]
-    except Exception as e:
-        await ctx.send(f"❌ Error during lookup: {e}")
-        return
+
     if not ctx.author.voice:
-        await ctx.send(f"⚠️ I found the zone for {place_name} (`{zone_id}`), but you must be in a voice channel to finish setup!")
+        await ctx.send("⚠️ You must be in a voice channel to finish setup.")
         return
+
     vc_id, text_id = ctx.author.voice.channel.id, ctx.channel.id
-    servers_db[str(ctx.guild.id)] = {"zone": zone_id, "place_name": place_name, "text_channel_id": text_id, "voice_channel_id": vc_id, "guild_name": ctx.guild.name, "zip_code": zip_code}
+
+    config = servers_db.get(str(ctx.guild.id), {})
+    config["text_channel_id"] = text_id
+    config["voice_channel_id"] = vc_id
+    config["guild_name"] = ctx.guild.name
+    if default_uk_location:
+        config["uk_location"] = default_uk_location
+
+    servers_db[str(ctx.guild.id)] = config
     save_db(servers_db)
+
     if ctx.voice_client: await ctx.voice_client.move_to(ctx.author.voice.channel)
     else: await ctx.author.voice.channel.connect(self_deaf=True)
-    await ctx.send(f"✅ **Setup Complete!**\n📍 **Location:** {place_name}\n📡 **Monitoring Zone:** `{zone_id}`\n🔊 **VC:** <#{vc_id}>\n💬 **Text:** <#{text_id}>")
+
+    location_text = config.get("uk_location", "Not set")
+    voice_text = config.get("voice_name", "System default")
+    await ctx.send(
+        f"✅ **Setup Complete!**\n"
+        f"📍 **Default UK Forecast Location:** {location_text}\n"
+        f"🗣️ **Voice:** {voice_text}\n"
+        f"🔊 **VC:** <#{vc_id}>\n"
+        f"💬 **Text:** <#{text_id}>"
+    )
 
 @bot.command()
 async def join(ctx):
+    if not await ensure_voice_runtime(ctx):
+        return
+
     if ctx.author.voice:
-        if ctx.voice_client: await ctx.voice_client.move_to(ctx.author.voice.channel)
-        else: await ctx.author.voice.channel.connect(self_deaf=True)
+        vc, err = await get_or_connect_voice_client(
+            ctx.guild,
+            servers_db.get(str(ctx.guild.id), {}),
+            fallback_channel=ctx.author.voice.channel,
+        )
+        if not vc:
+            await ctx.send(err)
+            return
         await ctx.send(f"Joined {ctx.author.voice.channel.name}")
     else: await ctx.send("Join a voice channel first.")
 
@@ -396,43 +639,319 @@ async def leave(ctx):
 
 @bot.command()
 async def test(ctx):
+    if not await ensure_voice_runtime(ctx):
+        return
+
     guild_id_str = str(ctx.guild.id)
     config = servers_db.get(guild_id_str, {})
-    zone = config.get("zone", "COC043")
-    vc = ctx.voice_client
+    vc, err = await get_or_connect_voice_client(ctx.guild, config)
     if not vc:
-        vc_id = config.get("voice_channel_id")
-        if vc_id:
-            channel = ctx.guild.get_channel(vc_id)
-            if channel:
-                try: vc = await channel.connect(self_deaf=True)
-                except Exception as e: await ctx.send(f"Failed to auto-join VC: {e}")
-    if not vc:
-        await ctx.send("I need to be in a voice channel first.")
+        await ctx.send(err or "I need to be in a voice channel first.")
         return
     if vc.is_playing():
         await ctx.send("Audio is already playing.")
         return
     await ctx.send("Generating test EAS message...")
-    text = f"This is a test of the Emergency Alert System for zone {zone}. This is only a test."
+    location = config.get("uk_location", ctx.guild.name)
+    voice_name = config.get("voice_name")
+    text = f"This is a test of the Emergency Alert System for {location}. This is only a test."
     try:
         text_id = config.get("text_channel_id")
         if text_id:
             text_channel = ctx.guild.get_channel(text_id)
             if text_channel:
-                embed = discord.Embed(title="🚨 Required Monthly Test", description=f"**Location:** {config.get('place_name', zone)}\n**Issued By:** Bot Admin", color=discord.Color.blue())
+                embed = discord.Embed(title="🚨 Required Monthly Test", description=f"**Location:** {location}\n**Issued By:** Bot Admin", color=discord.Color.blue())
                 embed.add_field(name="Details", value=text, inline=False)
                 await text_channel.send(content="🚨 **TEST ALERT** 🚨", embed=embed)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{ARCHIVE_DIR}/test_alert_{ctx.guild.id}_{timestamp}.mp3"
         intro = "This voice channel has been interrupted in order to partissipate in the emergency alert system."
-        await asyncio.to_thread(generate_eas_message, text, filename, intro)
-        vc.play(discord.FFmpegPCMAudio(source=filename))
+        await asyncio.to_thread(generate_eas_message, text, filename, intro, voice_name)
+        guild_history = alert_history.setdefault(guild_id_str, [])
+        guild_history.append({"event": "Test Alert", "time": datetime.now().strftime("%I:%M %p")})
+        play_err = await play_audio_file(vc, filename)
+        if play_err:
+            await ctx.send(f"Failed to start audio playback: {play_err}")
+            return
         await ctx.send("Now playing the test message.")
     except Exception as e: await ctx.send(f"Failed to play audio: {e}")
 
+
+@bot.command(aliases=['rpalert', 'alert'])
+@commands.has_permissions(administrator=True)
+async def customalert(ctx, *, payload: str):
+    if not await ensure_voice_runtime(ctx):
+        return
+
+    """
+    Usage:
+    <prefix>customalert Event | Message | Area(optional) | Severity(optional)
+    """
+    parts = [p.strip() for p in payload.split('|') if p.strip()]
+    if len(parts) < 2:
+        prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
+        await ctx.send(f"Usage: `{prefix}customalert Event | Message | Area(optional) | Severity(optional)`")
+        return
+
+    event = parts[0]
+    message = parts[1]
+    area = parts[2] if len(parts) > 2 else ctx.guild.name
+    severity = parts[3] if len(parts) > 3 else "Moderate"
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    voice_name = config.get("voice_name")
+
+    fallback_channel = ctx.author.voice.channel if ctx.author.voice else None
+    vc, err = await get_or_connect_voice_client(ctx.guild, config, fallback_channel=fallback_channel)
+
+    if not vc:
+        await ctx.send(err)
+        return
+
+    if vc.is_playing():
+        await ctx.send("Audio is already playing.")
+        return
+
+    color = discord.Color.gold()
+    if severity.lower() in ["severe", "extreme", "critical"]:
+        color = discord.Color.red()
+
+    embed = discord.Embed(title=f"🚨 {event}", description=f"**Area:** {area}\n**Severity:** {severity}\n**Issued By:** {ctx.author.display_name}", color=color)
+    embed.add_field(name="Details", value=message[:1024], inline=False)
+    await ctx.send(content="🚨 **CUSTOM RP ALERT** 🚨", embed=embed)
+
+    spoken_text = f"{event}. {message}. Affected area: {area}. Severity: {severity}."
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{ARCHIVE_DIR}/custom_alert_{ctx.guild.id}_{timestamp}.mp3"
+    intro = "This voice channel has been interrupted for a roleplay emergency alert."
+
+    try:
+        await asyncio.to_thread(generate_eas_message, spoken_text, filename, intro, voice_name)
+        guild_history = alert_history.setdefault(guild_id_str, [])
+        guild_history.append({"event": event, "time": datetime.now().strftime("%I:%M %p")})
+        play_err = await play_audio_file(vc, filename)
+        if play_err:
+            await ctx.send(f"Failed to start audio playback: {play_err}")
+    except Exception as e:
+        await ctx.send(f"Failed to generate custom alert audio: {e}")
+
+
+@bot.command(name='voices')
+async def voices(ctx):
+    await ctx.send("Scanning installed SAPI voices...")
+    voice_names = await asyncio.to_thread(list_installed_voices)
+    if not voice_names:
+        await ctx.send("No installed SAPI voices were detected.")
+        return
+
+    message = "**Installed voices:**\n"
+    for name in voice_names:
+        line = f"- {name}\n"
+        if len(message) + len(line) > 1900:
+            await ctx.send(message)
+            message = ""
+        message += line
+    if message:
+        await ctx.send(message)
+
+
+@bot.command(name='voice')
+async def voice(ctx):
+    config = servers_db.get(str(ctx.guild.id), {})
+    selected = config.get("voice_name", "System default")
+    await ctx.send(f"Current configured voice: **{selected}**")
+
+
+@bot.command(name='setvoice')
+@commands.has_permissions(administrator=True)
+async def setvoice(ctx, *, voice_name: str):
+    voice_names = await asyncio.to_thread(list_installed_voices)
+    if not voice_names:
+        await ctx.send("No installed SAPI voices were detected.")
+        return
+
+    selected = next((v for v in voice_names if v.lower() == voice_name.lower()), None)
+    if not selected:
+        suggestions = [v for v in voice_names if voice_name.lower() in v.lower()]
+        if suggestions:
+            await ctx.send("Voice not found. Did you mean:\n" + "\n".join(f"- {v}" for v in suggestions[:10]))
+        else:
+            prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
+            await ctx.send(f"Voice not found. Use `{prefix}voices` to list installed voices.")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    config["voice_name"] = selected
+    servers_db[guild_id_str] = config
+    save_db(servers_db)
+    await ctx.send(f"✅ Voice set to **{selected}**")
+
+
+@bot.command(name='prefix')
+async def prefix(ctx):
+    if not ctx.guild:
+        await ctx.send(f"Current command prefix: **{DEFAULT_PREFIX}**")
+        return
+
+    current = get_guild_prefix(ctx.guild.id)
+    await ctx.send(f"Current command prefix for this server: **{current}**")
+
+
+@bot.command(name='setprefix')
+@commands.has_permissions(administrator=True)
+async def setprefix(ctx, *, new_prefix: str):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+
+    cleaned = new_prefix.strip()
+    if not cleaned:
+        await ctx.send("Prefix cannot be empty.")
+        return
+    if len(cleaned) > 5:
+        await ctx.send("Prefix must be 1 to 5 characters long.")
+        return
+    if any(ch.isspace() for ch in cleaned):
+        await ctx.send("Prefix cannot contain spaces.")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    old_prefix = config.get("command_prefix", DEFAULT_PREFIX)
+    config["command_prefix"] = cleaned
+    servers_db[guild_id_str] = config
+    save_db(servers_db)
+
+    await ctx.send(
+        f"✅ Command prefix changed from **{old_prefix}** to **{cleaned}**.\n"
+        f"Try: `{cleaned}help`"
+    )
+
+
+@bot.command(name='windunit')
+async def windunit(ctx):
+    unit = get_wind_unit(ctx.guild.id) if ctx.guild else "kph"
+    await ctx.send(f"Current wind speed unit: **{unit}**")
+
+
+@bot.command(name='setwindunit')
+@commands.has_permissions(administrator=True)
+async def setwindunit(ctx, unit: str):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+
+    normalized = unit.strip().lower()
+    if normalized not in ["mph", "kph"]:
+        prefix = get_guild_prefix(ctx.guild.id)
+        await ctx.send(f"Invalid unit. Use `{prefix}setwindunit mph` or `{prefix}setwindunit kph`.")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    config["wind_unit"] = normalized
+    servers_db[guild_id_str] = config
+    save_db(servers_db)
+    await ctx.send(f"✅ Wind speed unit set to **{normalized}**")
+
+
+@bot.command(name='weathersounds')
+async def weathersounds(ctx):
+    config = servers_db.get(str(ctx.guild.id), {}) if ctx.guild else {}
+    intro_file = config.get("weather_intro_file")
+    outro_file = config.get("weather_outro_file")
+
+    intro_status = os.path.basename(intro_file) if intro_file and os.path.exists(intro_file) else "Default tone"
+    outro_status = os.path.basename(outro_file) if outro_file and os.path.exists(outro_file) else "Default tone"
+    await ctx.send(f"Weather sound settings:\n- Intro: **{intro_status}**\n- Outro: **{outro_status}**")
+
+
+@bot.command(name='setweatherintro')
+@commands.has_permissions(administrator=True)
+async def setweatherintro(ctx):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+    if not ctx.message.attachments:
+        await ctx.send("Attach an audio file (.mp3, .wav, .ogg, .m4a) with this command.")
+        return
+
+    attachment = ctx.message.attachments[0]
+    if not any(attachment.filename.lower().endswith(ext) for ext in [".mp3", ".wav", ".ogg", ".m4a"]):
+        await ctx.send("Unsupported file format. Use .mp3, .wav, .ogg, or .m4a")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    ext = os.path.splitext(attachment.filename)[1].lower()
+    target_path = os.path.join(WEATHER_SOUNDS_DIR, f"{guild_id_str}_intro{ext}")
+
+    old_intro = config.get("weather_intro_file")
+    await attachment.save(target_path)
+    if old_intro and old_intro != target_path and os.path.exists(old_intro):
+        os.remove(old_intro)
+
+    config["weather_intro_file"] = target_path
+    servers_db[guild_id_str] = config
+    save_db(servers_db)
+    await ctx.send(f"✅ Custom weather intro set to **{attachment.filename}**")
+
+
+@bot.command(name='setweatheroutro')
+@commands.has_permissions(administrator=True)
+async def setweatheroutro(ctx):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+    if not ctx.message.attachments:
+        await ctx.send("Attach an audio file (.mp3, .wav, .ogg, .m4a) with this command.")
+        return
+
+    attachment = ctx.message.attachments[0]
+    if not any(attachment.filename.lower().endswith(ext) for ext in [".mp3", ".wav", ".ogg", ".m4a"]):
+        await ctx.send("Unsupported file format. Use .mp3, .wav, .ogg, or .m4a")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    ext = os.path.splitext(attachment.filename)[1].lower()
+    target_path = os.path.join(WEATHER_SOUNDS_DIR, f"{guild_id_str}_outro{ext}")
+
+    old_outro = config.get("weather_outro_file")
+    await attachment.save(target_path)
+    if old_outro and old_outro != target_path and os.path.exists(old_outro):
+        os.remove(old_outro)
+
+    config["weather_outro_file"] = target_path
+    servers_db[guild_id_str] = config
+    save_db(servers_db)
+    await ctx.send(f"✅ Custom weather outro set to **{attachment.filename}**")
+
+
+@bot.command(name='clearweathersounds')
+@commands.has_permissions(administrator=True)
+async def clearweathersounds(ctx):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    config = servers_db.get(guild_id_str, {})
+    intro_file = config.pop("weather_intro_file", None)
+    outro_file = config.pop("weather_outro_file", None)
+
+    for file_path in [intro_file, outro_file]:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+    servers_db[guild_id_str] = config
+    save_db(servers_db)
+    await ctx.send("✅ Cleared custom weather intro/outro. Default tones will be used.")
+
 @bot.command()
-@commands.is_owner()
+@configured_owner_only()
 async def pipe(ctx):
     if not ctx.message.attachments:
         await ctx.send("Please upload an audio file (.mp3, .wav, .ogg, .m4a) with this command.")
@@ -467,14 +986,7 @@ async def pipe(ctx):
         for guild_id_str, config in servers_db.items():
             guild = bot.get_guild(int(guild_id_str))
             if not guild: continue
-            vc = guild.voice_client
-            if not vc or not vc.is_connected():
-                vc_id = config.get("voice_channel_id")
-                if vc_id:
-                    channel = guild.get_channel(vc_id)
-                    if channel:
-                        try: vc = await channel.connect(self_deaf=True)
-                        except: continue
+            vc, _ = await get_or_connect_voice_client(guild, config)
             if not vc or not vc.is_connected() or vc.is_playing(): continue
             guild_filename = f"{ARCHIVE_DIR}/pipe_broadcast_{guild.id}_{timestamp}.mp3"
             shutil.copy(base_filename, guild_filename)
@@ -482,10 +994,12 @@ async def pipe(ctx):
             if text_id:
                 text_channel = guild.get_channel(text_id)
                 if text_channel:
-                    embed = discord.Embed(title="🚨 Manual EAS Broadcast", description=f"**Location:** {config.get('place_name', 'All Zones')}\n**Issued By:** Bot Owner", color=discord.Color.red())
+                    embed = discord.Embed(title="🚨 Manual EAS Broadcast", description=f"**Location:** {config.get('uk_location', 'All Zones')}\n**Issued By:** Bot Owner", color=discord.Color.red())
                     embed.add_field(name="Details", value="An audio broadcast has been manually issued by the system administrator.", inline=False)
                     bot.loop.create_task(text_channel.send(content="🚨 **MANUAL BROADCAST** 🚨", embed=embed))
-            vc.play(discord.FFmpegPCMAudio(source=guild_filename))
+            play_err = await play_audio_file(vc, guild_filename)
+            if play_err:
+                print(f"Pipe playback skipped in guild {guild.id}: {play_err}")
         await ctx.send("📢 Global broadcast initiated.")
     except Exception as e: await ctx.send(f"❌ Failed: {e}")
 
@@ -495,18 +1009,12 @@ async def ping(ctx): await ctx.send(f'Pong! {round(bot.latency * 1000)}ms')
 @bot.command()
 async def active(ctx):
     guild_id_str = str(ctx.guild.id)
-    if guild_id_str not in servers_db:
-        await ctx.send("Run `fco!setup <ZIP>`.")
+    recent = alert_history.get(guild_id_str, [])
+    if not recent:
+        await ctx.send("🟢 No active or recent manual RP alerts in this server.")
         return
-    zone = servers_db[guild_id_str]["zone"]
-    zone_alerts = active_alerts_cache.get(zone, [])
-    if not zone_alerts:
-        await ctx.send(f"🟢 No active alerts for {zone}.")
-        return
-    message = f"**Active Alerts for {zone}:**\n"
-    for alert in zone_alerts:
-        message += f"⚠️ **{alert['event']}** ({alert['sender']})\n> {alert['headline']}\n\n"
-    await ctx.send(message[:2000])
+    latest = recent[-1]
+    await ctx.send(f"🔔 Most recent manual alert: **{latest['event']}** at {latest['time']}")
 
 @bot.command(aliases=['silence'])
 async def stop(ctx):
@@ -518,210 +1026,212 @@ async def stop(ctx):
 @bot.command()
 async def status(ctx):
     guild_id_str = str(ctx.guild.id)
-    zone = servers_db.get(guild_id_str, {}).get("zone", "Not configured")
+    config = servers_db.get(guild_id_str, {})
+    location = config.get("uk_location", "Not configured")
+    selected_voice = config.get("voice_name", "System default")
+    selected_prefix = config.get("command_prefix", DEFAULT_PREFIX)
+    wind_unit = config.get("wind_unit", "kph")
     vc_status = f"Connected to '{ctx.voice_client.channel.name}'" if ctx.voice_client else "Not connected"
-    await ctx.send(f"**EAS Bot Status**\n📡 **Zone:** `{zone}`\n🔊 **Voice:** {vc_status}\n⏱️ **API:** Active\n🏓 **Ping:** {round(bot.latency * 1000)}ms\n🌐 **Servers:** {len(servers_db)}")
+    await ctx.send(f"**EAS Bot Status**\n📡 **Mode:** Manual RP Alerts\n⌨️ **Command Prefix:** {selected_prefix}\n📍 **Default UK Location:** {location}\n🗣️ **Voice Name:** {selected_voice}\n💨 **Wind Speed Unit:** {wind_unit}\n🔊 **Voice Connection:** {vc_status}\n🏓 **Ping:** {round(bot.latency * 1000)}ms\n🌐 **Servers:** {len(servers_db)}")
 
 @bot.command()
 async def history(ctx):
     guild_id_str = str(ctx.guild.id)
-    if guild_id_str not in servers_db: return
-    zone = servers_db[guild_id_str]["zone"]
-    history_list = alert_history.get(zone, [])
+    history_list = alert_history.get(guild_id_str, [])
     if not history_list:
-        await ctx.send(f"No history for {zone}.")
+        await ctx.send("No manual alert history for this server.")
         return
-    message = f"**Recent Alert History for {zone}:**\n"
+    message = "**Recent Manual Alert History:**\n"
     for alert in reversed(history_list[-5:]):
         message += f"- **{alert['event']}** at {alert['time']}\n"
     await ctx.send(message)
 
+
+def weather_code_to_text(code):
+    return UK_WEATHER_CODE_MAP.get(code, "mixed conditions")
+
+
+def add_forecast_sounds(audio_file, intro_file=None, outro_file=None):
+    from pydub import AudioSegment
+    from pydub.generators import Sine
+
+    base = AudioSegment.from_file(audio_file)
+
+    if intro_file and os.path.exists(intro_file):
+        pre = AudioSegment.from_file(intro_file)
+    else:
+        pre = Sine(1100).to_audio_segment(duration=220).apply_gain(-16)
+
+    if outro_file and os.path.exists(outro_file):
+        post = AudioSegment.from_file(outro_file)
+    else:
+        post = Sine(750).to_audio_segment(duration=260).apply_gain(-16)
+
+    pre = pre + AudioSegment.silent(duration=130)
+    post = AudioSegment.silent(duration=130) + post
+    combined = pre + base + post
+    combined.export(audio_file, format="mp3")
+
+
 @bot.command()
-async def weather(ctx, target_zip: str = None):
+async def weather(ctx, *, location_and_flags: str = None):
+    if not await ensure_voice_runtime(ctx):
+        return
+
     guild_id_str = str(ctx.guild.id)
     config = servers_db.get(guild_id_str, {})
-    zip_to_use = target_zip or config.get("zip_code")
-    if not zip_to_use:
-        await ctx.send("Provide a ZIP or run `fco!setup`.")
+    wind_unit = get_wind_unit(ctx.guild.id)
+    wind_unit_label = "mph" if wind_unit == "mph" else "km/h"
+
+    raw_query = location_and_flags or ""
+    with_sounds = "--sounds" in raw_query.lower()
+    location = raw_query.replace("--sounds", "").strip() if raw_query else ""
+    if not location:
+        location = config.get("uk_location", "")
+
+    if not location:
+        prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
+        await ctx.send(f"Provide a UK location. Example: `{prefix}weather London --sounds` or run `{prefix}setup London`.")
         return
-    await ctx.send(f"🔍 Fetching detailed 7-day forecast for {zip_to_use}... 📡")
-    headers = {"User-Agent": "EASDiscordBot/1.0"}
+
+    await ctx.send(f"🔍 Fetching UK forecast for **{location}**...")
+
     try:
-        zip_res = requests.get(f"http://api.zippopotam.us/us/{zip_to_use}", timeout=10)
-        if zip_res.status_code != 200:
-            await ctx.send("❌ ZIP not found.")
+        geocode_url = "https://geocoding-api.open-meteo.com/v1/search"
+        geo_res = requests.get(
+            geocode_url,
+            params={"name": location, "count": 5, "language": "en", "format": "json", "countryCode": "GB"},
+            timeout=12,
+        )
+        if geo_res.status_code != 200:
+            await ctx.send("❌ Failed to contact the UK geocoding service.")
             return
-        zip_data = zip_res.json()
-        lat, lon = zip_data['places'][0]['latitude'], zip_data['places'][0]['longitude']
-        place_name = f"{zip_data['places'][0]['place name']}, {zip_data['places'][0]['state abbreviation']}"
-        points_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers, timeout=10)
-        points_data = points_res.json()
-        forecast_url = points_data.get('properties', {}).get('forecast')
-        cwa = points_data.get('properties', {}).get('cwa')
-        hwo_url = f"https://api.weather.gov/products/types/HWO/locations/{cwa}"
-        forecast_text_blocks = []
-        spoken_text = f"Detailed forecast for {place_name}. "
-        res_forecast = requests.get(forecast_url, headers=headers, timeout=10)
-        if res_forecast.status_code == 200:
-            periods = res_forecast.json().get('properties', {}).get('periods', [])
-            current_block = ""
-            for period in periods:
-                line = f"**{period.get('name')}**: {period.get('detailedForecast')}\n"
-                if len(current_block) + len(line) > 1800:
-                    forecast_text_blocks.append(current_block); current_block = line
-                else: current_block += line
-                spoken_text += f"{period.get('name')}. {period.get('detailedForecast')} "
-            if current_block: forecast_text_blocks.append(current_block)
-        res_hwo_list = requests.get(hwo_url, headers=headers, timeout=10)
-        def parse_hwo_text(t):
-            m = re.search(r'(This hazardous weather outlook|\.DAY ONE.*?|DISCUSSION\.\.\.)', t, re.I)
-            if m:
-                p = re.split(r'\.SPOTTER|\$\$|\&\&', t[m.start():], flags=re.I)[0].strip()
-                return re.sub(r'\s+', ' ', p.replace('\n', ' ').replace('*', ''))
-            return None
-        hwo_found, hwo_summary = False, ""
-        if res_hwo_list.status_code == 200 and res_hwo_list.json().get('@graph'):
-            url = res_hwo_list.json()['@graph'][0]['@id']
-            res_hwo = requests.get(url, headers=headers, timeout=10)
-            parsed = parse_hwo_text(res_hwo.json().get('productText', ''))
-            if parsed: hwo_summary = parsed; spoken_text += " Hazardous Weather Outlook. " + parsed; hwo_found = True
-        if not hwo_found and cwa:
-            try:
-                from bs4 import BeautifulSoup
-                scrape_res = requests.get(f"https://www.weather.gov/{cwa.lower()}/ghwo", headers=headers, timeout=10)
-                if scrape_res.status_code == 200:
-                    soup = BeautifulSoup(scrape_res.content, 'html.parser')
-                    for table in soup.find_all('table'):
-                        parsed = parse_hwo_text(table.get_text())
-                        if parsed: hwo_summary = parsed; spoken_text += " Hazardous Weather Outlook. " + parsed; hwo_found = True; break
-            except: pass
-        if not hwo_found:
-            afd_res = requests.get(f"https://api.weather.gov/products/types/AFD/locations/{cwa}", headers=headers, timeout=10)
-            if afd_res.status_code == 200 and afd_res.json().get('@graph'):
-                url = afd_res.json()['@graph'][0]['@id']
-                res_afd = requests.get(url, headers=headers, timeout=10)
-                m = re.search(r'\.(?:KEY MESSAGES|SYNOPSIS)\.\.\.(.*?)\&\&', res_afd.json().get('productText', ''), re.S | re.I)
-                if m:
-                    hwo_summary = re.sub(r'\s+', ' ', m.group(1).replace('\n', ' ').replace('*', '').replace('-', ''))
-                    hwo_summary = re.sub(r'(?:Updated|Revised) at.*?\d{4}', '', hwo_summary, flags=re.I).strip()
-                    spoken_text += " Regional Weather Summary. " + hwo_summary; hwo_found = True
-        if not hwo_found: hwo_summary = "No outlook active."
-        spoken_text += " For the latest information, go to weather.gov."
-        for i, block in enumerate(forecast_text_blocks):
-            embed = discord.Embed(title=f"🌤️ 7-Day Forecast: {place_name} ({i+1}/{len(forecast_text_blocks)})", description=block, color=discord.Color.blue())
-            if i == len(forecast_text_blocks) - 1: embed.add_field(name="⚠️ Outlook", value=hwo_summary[:1024], inline=False)
-            await ctx.send(embed=embed)
-            if i < len(forecast_text_blocks) - 1: await asyncio.sleep(10)
-        if ctx.voice_client and not ctx.voice_client.is_playing():
+        geo_data = geo_res.json()
+        results = geo_data.get("results", [])
+        if not results:
+            await ctx.send("❌ No UK location match found. Try a town/city name like `Leeds` or `Bristol`.")
+            return
+
+        best = results[0]
+        lat = best.get("latitude")
+        lon = best.get("longitude")
+        resolved_name = ", ".join(
+            p for p in [best.get("name"), best.get("admin1"), best.get("country")] if p
+        )
+
+        forecast_res = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max",
+                "timezone": "Europe/London",
+                "forecast_days": 7,
+            },
+            timeout=12,
+        )
+        if forecast_res.status_code != 200:
+            await ctx.send("❌ Failed to fetch weather forecast data.")
+            return
+
+        daily = forecast_res.json().get("daily", {})
+        dates = daily.get("time", [])
+        codes = daily.get("weather_code", [])
+        highs = daily.get("temperature_2m_max", [])
+        lows = daily.get("temperature_2m_min", [])
+        rain = daily.get("precipitation_probability_max", [])
+        wind = daily.get("wind_speed_10m_max", [])
+
+        if not dates:
+            await ctx.send("❌ Forecast response did not contain daily data.")
+            return
+
+        lines = []
+        spoken_chunks = []
+        for idx, day in enumerate(dates):
+            condition = weather_code_to_text(codes[idx] if idx < len(codes) else -1)
+            high = highs[idx] if idx < len(highs) else "?"
+            low = lows[idx] if idx < len(lows) else "?"
+            rain_chance = rain[idx] if idx < len(rain) else "?"
+            max_wind_kph = wind[idx] if idx < len(wind) else "?"
+            max_wind = convert_wind_speed(max_wind_kph, wind_unit)
+            lines.append(
+                f"**{day}** - {condition}; High {high} C, Low {low} C; Rain chance {rain_chance}%; Wind up to {max_wind} {wind_unit_label}"
+            )
+            spoken_chunks.append(
+                f"{day}. {condition}. High {high} degrees. Low {low} degrees. Rain chance {rain_chance} percent. Wind up to {max_wind} {'miles per hour' if wind_unit == 'mph' else 'kilometers per hour'}."
+            )
+
+        embed = discord.Embed(
+            title=f"🌦️ UK 7-Day Forecast: {resolved_name}",
+            description="\n".join(lines)[:4000],
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Source: Open-Meteo geocoding + forecast APIs")
+        await ctx.send(embed=embed)
+
+        if "uk_location" not in config:
+            config["uk_location"] = resolved_name
+            servers_db[guild_id_str] = config
+            save_db(servers_db)
+
+        fallback_channel = ctx.author.voice.channel if ctx.author.voice else None
+        vc, err = await get_or_connect_voice_client(ctx.guild, config, fallback_channel=fallback_channel)
+
+        if vc:
             filename = f"{ARCHIVE_DIR}/weather_{ctx.guild.id}_{datetime.now().strftime('%H%M%S')}.mp3"
-            await asyncio.to_thread(generate_normal_speech, spoken_text, filename)
-            ctx.voice_client.play(discord.FFmpegPCMAudio(source=filename))
-    except Exception as e: print(f"Weather error: {e}"); await ctx.send("Error fetching weather.")
+            voice_name = config.get("voice_name")
+            spoken_text = f"Seven day UK forecast for {resolved_name}. " + " ".join(spoken_chunks)
+            await asyncio.to_thread(generate_normal_speech, spoken_text, filename, voice_name)
+            if with_sounds:
+                intro_file = config.get("weather_intro_file")
+                outro_file = config.get("weather_outro_file")
+                await asyncio.to_thread(add_forecast_sounds, filename, intro_file, outro_file)
+            play_err = await play_audio_file(vc, filename)
+            if play_err:
+                await ctx.send(f"Forecast generated, but playback failed: {play_err}")
+            else:
+                await ctx.send("🔊 Reading forecast in voice channel.")
+        else:
+            await ctx.send(f"Forecast generated, but voice playback could not start: {err}")
+    except Exception as e:
+        print(f"Weather error: {e}")
+        await ctx.send("Error fetching weather.")
 
 @bot.command(aliases=['testg'])
-@commands.is_owner()
+@configured_owner_only()
 async def testglobal(ctx): await trigger_global_test("Bot Owner")
 
 @bot.command()
-@commands.is_owner()
+@configured_owner_only()
 async def serverslist(ctx):
     if not servers_db: return await ctx.send("No servers.")
     msg = "**Servers:**\n"
-    for gid, cfg in servers_db.items(): msg += f"- **{cfg.get('guild_name')}**: {cfg.get('zone')}\n"
+    for gid, cfg in servers_db.items():
+        msg += f"- **{cfg.get('guild_name')}**: Voice={cfg.get('voice_name', 'System default')} | Default UK Location={cfg.get('uk_location', 'Not set')}\n"
     await ctx.send(msg[:2000])
 
 @bot.command()
-@commands.is_owner()
+@configured_owner_only()
 async def freshpull(ctx):
-    await ctx.send("🔄 Pulling...")
-    await check_nws_alerts()
-    await ctx.send("✅ Done.")
+    prefix = get_guild_prefix(ctx.guild.id) if ctx.guild else DEFAULT_PREFIX
+    await ctx.send(f"Auto alert pulling is disabled in RP mode. Use `{prefix}customalert` for manual broadcasts.")
 
 @bot.command()
-@commands.is_owner()
+@configured_owner_only()
 async def shutdown(ctx): await ctx.send("🛑 Closing..."); await bot.close()
 
 @bot.command()
-@commands.is_owner()
+@configured_owner_only()
 async def restart(ctx): await ctx.send("🔄 Restarting..."); await bot.close(); os._exit(0)
 
 @bot.command()
-@commands.is_owner()
+@configured_owner_only()
 async def getlogs(ctx):
     await ctx.send("Logs:")
     files = [discord.File(f) for f in ["logs/bot.log", "logs/bot_errors.log"] if os.path.exists(f)]
     if files: await ctx.send(files=files)
     else: await ctx.send("No logs.")
-
-last_weekly_test_date = None
-
-@tasks.loop(minutes=2.0)
-async def check_nws_alerts():
-    global active_alerts_cache, alert_history, last_weekly_test_date
-    try:
-        now_mdt = datetime.now(pytz.timezone("US/Mountain"))
-        if now_mdt.weekday() == 2 and now_mdt.hour == 9 and now_mdt.minute >= 30:
-            if last_weekly_test_date != now_mdt.strftime("%Y-%m-%d"):
-                last_weekly_test_date = now_mdt.strftime("%Y-%m-%d")
-                await trigger_global_test("Automated System")
-    except Exception as e: print(f"Weekly test error: {e}")
-    unique_zones = set(cfg["zone"] for cfg in servers_db.values())
-    if not unique_zones: return
-    headers = {"User-Agent": "EASDiscordBot/1.0", "Accept": "application/geo+json"}
-    async with aiohttp.ClientSession() as session:
-        for zone in unique_zones:
-            try:
-                async with session.get(f"https://api.weather.gov/alerts/active?zone={zone}", headers=headers, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        new_cache, new_alerts = [], []
-                        for f in data.get('features', []):
-                            p = f.get('properties', {})
-                            aid, ev, sname, hline, desc, inst, sev, adesc = p.get('id'), p.get('event', 'Alert'), p.get('senderName', 'NWS'), p.get('headline', ''), p.get('description', ''), p.get('instruction', ''), p.get('severity', 'Unknown'), p.get('areaDesc', '')
-                            new_cache.append({"event": ev, "sender": sname, "headline": hline})
-                            if aid and aid not in seen_alerts:
-                                seen_alerts.add(aid)
-                                if zone not in alert_history: alert_history[zone] = []
-                                alert_history[zone].append({"event": ev, "time": datetime.now().strftime("%I:%M %p")})
-                                new_alerts.append((aid, sname, hline, desc, inst, sev, adesc, ev))
-                        active_alerts_cache[zone] = new_cache
-                        for gid, cfg in servers_db.items():
-                            if cfg.get("zone") == zone:
-                                guild = bot.get_guild(int(gid))
-                                if not guild: continue
-                                tid = cfg.get("text_channel_id")
-                                if tid:
-                                    tchan = guild.get_channel(tid)
-                                    if tchan:
-                                        for aid, sname, hline, desc, inst, sev, adesc, ev in new_alerts:
-                                            color = discord.Color.red() if sev in ["Extreme", "Severe"] else discord.Color.gold()
-                                            embed = discord.Embed(title=f"🚨 {ev}", description=f"**Location:** {cfg.get('place_name', zone)}\n**Affected:** {adesc.replace(';', ',')}", color=color)
-                                            embed.add_field(name="Headline", value=hline, inline=False)
-                                            if desc: embed.add_field(name="Details", value=desc[:1020], inline=False)
-                                            ping = "@everyone " if ev in URGENT_EVENTS else ""
-                                            bot.loop.create_task(tchan.send(content=f"{ping}🚨 **NEW ALERT** 🚨", embed=embed))
-                                vc = guild.voice_client
-                                if vc and vc.is_connected() and not vc.is_playing() and new_alerts:
-                                    aid, sname, hline, desc, inst, sev, adesc, ev = new_alerts[0]
-                                    speech = f"Transmitted at request of {sname}. {hline}. {desc.replace('\n', ' ')} Please note: {inst.replace('\n', ' ')}"
-                                    fname = f"{ARCHIVE_DIR}/alert_{aid.split('.')[-1]}_{gid}_{datetime.now().strftime('%H%M%S')}.mp3"
-                                    await asyncio.to_thread(generate_eas_message, speech, fname, "This voice channel has been interrupted for the Emergency Alert System.")
-                                    vc.play(discord.FFmpegPCMAudio(source=fname))
-            except Exception as e: print(f"API Error {zone}: {e}")
-    for gid, cfg in servers_db.items():
-        guild = bot.get_guild(int(gid))
-        if guild:
-            vc, vcid = guild.voice_client, cfg.get("voice_channel_id")
-            if vcid:
-                chan = guild.get_channel(vcid)
-                if chan and (not vc or not vc.is_connected()):
-                    try:
-                        if vc: await vc.disconnect(force=True)
-                        await chan.connect(self_deaf=True, reconnect=True, timeout=15.0)
-                    except: pass
-
-@check_nws_alerts.before_loop
-async def before_check_nws_alerts(): await bot.wait_until_ready()
 
 if __name__ == '__main__':
     if TOKEN: bot.run(TOKEN)
