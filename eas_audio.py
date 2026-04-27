@@ -6,6 +6,9 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 from EASGen import EASGen
 
+POWERSHELL_32 = r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+POWERSHELL_64 = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
 def clean_for_dectalk(text):
     """
     Cleans up NWS text so the older DECtalk/ScanSoft engine pronounces it correctly
@@ -97,40 +100,93 @@ def apply_radio_filter(audio_segment):
     # Add clicks at the very start and end
     return click_in + filtered + click_out
 
-def _generate_tom(text, filename):
+def list_installed_voices():
+    """Returns all installed SAPI voice names visible to 32-bit and 64-bit PowerShell."""
+    voice_names = set()
+    script = (
+        "Add-Type -AssemblyName System.Speech;"
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        "$s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name };"
+        "$s.Dispose()"
+    )
+
+    for ps_exe in [POWERSHELL_32, POWERSHELL_64]:
+        if not os.path.exists(ps_exe):
+            continue
+        try:
+            result = subprocess.run(
+                [ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+            for line in result.stdout.splitlines():
+                name = line.strip()
+                if name:
+                    voice_names.add(name)
+        except subprocess.SubprocessError:
+            continue
+
+    return sorted(voice_names, key=str.lower)
+
+
+def _generate_tom(text, filename, voice_name=None):
+    """Legacy wrapper kept for compatibility with existing imports/calls."""
+    _generate_tts(text, filename, voice_name=voice_name)
+
+
+def _generate_tts(text, filename, voice_name=None):
     import uuid
+
     abs_filename = os.path.abspath(filename)
     cleaned_text = clean_for_dectalk(text)
-    
-    # We need to use 32-bit PowerShell because ScanSoft Tom is a 32-bit SAPI5 voice.
-    # Python is 64-bit, so it can't directly access the 32-bit registry keys for this voice.
-    
-    # Use a UUID to ensure this temporary script file is completely unique
-    # and won't be accidentally deleted by another async thread generating audio at the exact same millisecond.
+    escaped_text = cleaned_text.replace("'", "''")
+    selected_voice = voice_name or ""
+    escaped_voice = selected_voice.replace("'", "''")
+
     unique_id = str(uuid.uuid4())[:8]
     ps_script_path = os.path.join(os.path.dirname(abs_filename), f"temp_ps_{os.getpid()}_{unique_id}.ps1")
-    
-    # Create the PowerShell script that loads System.Speech and calls Tom
-    ps_script = f"""
+
+    # Try 32-bit first to preserve compatibility with legacy voices like ScanSoft Tom.
+    ps_candidates = [POWERSHELL_32, POWERSHELL_64]
+    last_error = None
+
+    for ps_exe in ps_candidates:
+        if not os.path.exists(ps_exe):
+            continue
+
+        ps_script = f"""
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+if ('{escaped_voice}' -ne '') {{
+    $synth.SelectVoice('{escaped_voice}')
+}}
 $synth.SetOutputToWaveFile('{abs_filename}')
-$synth.SelectVoice('ScanSoft Tom_Full_22kHz')
-$synth.Speak('{cleaned_text.replace("'", "''")}')
+$synth.Speak('{escaped_text}')
 $synth.Dispose()
 """
-    with open(ps_script_path, "w", encoding="utf-8") as f:
-        f.write(ps_script)
-        
-    ps_exe = r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-    
-    try:
-        subprocess.run([ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_script_path], check=True)
-    finally:
-        if os.path.exists(ps_script_path):
-            os.remove(ps_script_path)
 
-def generate_eas_message(text, output_filename="alert.mp3", pre_speech=None):
+        with open(ps_script_path, "w", encoding="utf-8") as f:
+            f.write(ps_script)
+
+        try:
+            subprocess.run([ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_script_path], check=True)
+            return
+        except subprocess.SubprocessError as exc:
+            last_error = exc
+            continue
+        finally:
+            if os.path.exists(ps_script_path):
+                os.remove(ps_script_path)
+
+    if voice_name:
+        available = ", ".join(list_installed_voices()) or "No SAPI voices detected"
+        raise RuntimeError(f"Failed to generate speech with voice '{voice_name}'. Available voices: {available}") from last_error
+    raise RuntimeError("Failed to generate speech using available SAPI voices.") from last_error
+
+def generate_eas_message(text, output_filename="alert.mp3", pre_speech=None, voice_name=None):
     print(f"Generating audio for text: {text}")
     
     # 1. SAME Header
@@ -142,7 +198,7 @@ def generate_eas_message(text, output_filename="alert.mp3", pre_speech=None):
     
     # 3. Voice message (with radio filter)
     temp_tts_file = "temp_tts.wav"
-    _generate_tom(text, temp_tts_file)
+    _generate_tts(text, temp_tts_file, voice_name=voice_name)
     voice_raw = AudioSegment.from_wav(temp_tts_file)
     voice = apply_radio_filter(voice_raw)
     
@@ -158,7 +214,7 @@ def generate_eas_message(text, output_filename="alert.mp3", pre_speech=None):
     # 6. Pre-speech (if any, like "Issued by owner")
     if pre_speech:
         temp_pre_file = "temp_pre.wav"
-        _generate_tom(pre_speech, temp_pre_file)
+        _generate_tts(pre_speech, temp_pre_file, voice_name=voice_name)
         pre_voice = apply_radio_filter(AudioSegment.from_wav(temp_pre_file))
         final_audio = pre_voice + silence_long + final_audio
         if os.path.exists(temp_pre_file):
@@ -169,10 +225,10 @@ def generate_eas_message(text, output_filename="alert.mp3", pre_speech=None):
         os.remove(temp_tts_file)
     return output_filename
 
-def generate_normal_speech(text, output_filename="speech.mp3"):
+def generate_normal_speech(text, output_filename="speech.mp3", voice_name=None):
     print(f"Generating normal speech for text: {text}")
     temp_tts_file = "temp_tts_normal.wav"
-    _generate_tom(text, temp_tts_file)
+    _generate_tts(text, temp_tts_file, voice_name=voice_name)
     voice_raw = AudioSegment.from_wav(temp_tts_file)
     
     # Apply the radio radio atmosphere

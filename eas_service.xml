@@ -2,7 +2,7 @@
   <id>EASDiscordBot</id>
   <name>EAS Discord Bot Relay Service</name>
   <description>Runs the Python-based Software Defined ENDEC for Discord.</description>
-  <executable>C:\Users\ahpea\cobot\eas_bot\run_bot.bat</executable>
+  <executable>C:\git\RPEAS\run_bot.bat</executable>
   <logmode>rotate</logmode>
   <logpath>C:\Users\ahpea\cobot\eas_bot\logs</logpath>
   <workingdirectory>C:\Users\ahpea\cobot\eas_bot</workingdirectory>
