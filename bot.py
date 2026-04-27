@@ -6,6 +6,8 @@ import asyncio
 import json
 import getpass
 import re
+import shlex
+import subprocess
 import aiohttp
 from aiohttp import web
 import aiohttp_session
@@ -225,6 +227,25 @@ async def play_audio_file(vc, file_path):
         return f"Failed to start playback: {e}"
 
     return None
+
+
+async def restart_current_process():
+    """Restart this bot process in-place; fallback to spawning a new process if needed."""
+    await bot.close()
+
+    python_exe = sys.executable
+    argv = [python_exe] + sys.argv
+
+    try:
+        os.execv(python_exe, argv)
+    except Exception as exec_error:
+        print(f"Process re-exec failed: {exec_error}. Falling back to subprocess launch.")
+        try:
+            subprocess.Popen(argv, cwd=os.getcwd(), creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        except Exception as spawn_error:
+            print(f"Fallback spawn failed: {spawn_error}")
+        finally:
+            os._exit(0)
 
 # --- State Variables ---
 alert_history = {}  # Dict of guild_id -> list of alerts
@@ -1051,20 +1072,65 @@ def weather_code_to_text(code):
     return UK_WEATHER_CODE_MAP.get(code, "mixed conditions")
 
 
+def forecast_day_name(date_value):
+    try:
+        return datetime.strptime(str(date_value), "%Y-%m-%d").strftime("%A")
+    except Exception:
+        return str(date_value)
+
+
+def parse_weather_flags(raw_query):
+    """Parses weather input and extracts --sounds (case-insensitive)."""
+    if not raw_query:
+        return "", False
+
+    try:
+        tokens = shlex.split(raw_query)
+    except ValueError:
+        tokens = raw_query.split()
+
+    with_sounds = False
+    location_tokens = []
+    for token in tokens:
+        if token.lower() == "--sounds":
+            with_sounds = True
+        else:
+            location_tokens.append(token)
+
+    location = " ".join(location_tokens).strip()
+    return location, with_sounds
+
+
+def resolve_weather_sound_files(config):
+    intro_file = config.get("weather_intro_file")
+    outro_file = config.get("weather_outro_file")
+    intro_ok = bool(intro_file and os.path.exists(intro_file))
+    outro_ok = bool(outro_file and os.path.exists(outro_file))
+    return (intro_file if intro_ok else None, outro_file if outro_ok else None)
+
+
 def add_forecast_sounds(audio_file, intro_file=None, outro_file=None):
     from pydub import AudioSegment
     from pydub.generators import Sine
 
     base = AudioSegment.from_file(audio_file)
 
+    pre = None
     if intro_file and os.path.exists(intro_file):
-        pre = AudioSegment.from_file(intro_file)
-    else:
+        try:
+            pre = AudioSegment.from_file(intro_file)
+        except Exception as e:
+            print(f"Failed to load custom weather intro '{intro_file}': {e}. Falling back to default tone.")
+    if pre is None:
         pre = Sine(1100).to_audio_segment(duration=220).apply_gain(-16)
 
+    post = None
     if outro_file and os.path.exists(outro_file):
-        post = AudioSegment.from_file(outro_file)
-    else:
+        try:
+            post = AudioSegment.from_file(outro_file)
+        except Exception as e:
+            print(f"Failed to load custom weather outro '{outro_file}': {e}. Falling back to default tone.")
+    if post is None:
         post = Sine(750).to_audio_segment(duration=260).apply_gain(-16)
 
     pre = pre + AudioSegment.silent(duration=130)
@@ -1084,8 +1150,7 @@ async def weather(ctx, *, location_and_flags: str = None):
     wind_unit_label = "mph" if wind_unit == "mph" else "km/h"
 
     raw_query = location_and_flags or ""
-    with_sounds = "--sounds" in raw_query.lower()
-    location = raw_query.replace("--sounds", "").strip() if raw_query else ""
+    location, with_sounds = parse_weather_flags(raw_query)
     if not location:
         location = config.get("uk_location", "")
 
@@ -1149,6 +1214,7 @@ async def weather(ctx, *, location_and_flags: str = None):
         lines = []
         spoken_chunks = []
         for idx, day in enumerate(dates):
+            day_name = forecast_day_name(day)
             condition = weather_code_to_text(codes[idx] if idx < len(codes) else -1)
             high = highs[idx] if idx < len(highs) else "?"
             low = lows[idx] if idx < len(lows) else "?"
@@ -1156,10 +1222,10 @@ async def weather(ctx, *, location_and_flags: str = None):
             max_wind_kph = wind[idx] if idx < len(wind) else "?"
             max_wind = convert_wind_speed(max_wind_kph, wind_unit)
             lines.append(
-                f"**{day}** - {condition}; High {high} C, Low {low} C; Rain chance {rain_chance}%; Wind up to {max_wind} {wind_unit_label}"
+                f"**{day_name}** - {condition}; High {high} C, Low {low} C; Rain chance {rain_chance}%; Wind up to {max_wind} {wind_unit_label}"
             )
             spoken_chunks.append(
-                f"{day}. {condition}. High {high} degrees. Low {low} degrees. Rain chance {rain_chance} percent. Wind up to {max_wind} {'miles per hour' if wind_unit == 'mph' else 'kilometers per hour'}."
+                f"{day_name}. {condition}. High {high} degrees. Low {low} degrees. Rain chance {rain_chance} percent. Wind up to {max_wind} {'miles per hour' if wind_unit == 'mph' else 'kilometers per hour'}."
             )
 
         embed = discord.Embed(
@@ -1184,14 +1250,18 @@ async def weather(ctx, *, location_and_flags: str = None):
             spoken_text = f"Seven day UK forecast for {resolved_name}. " + " ".join(spoken_chunks)
             await asyncio.to_thread(generate_normal_speech, spoken_text, filename, voice_name)
             if with_sounds:
-                intro_file = config.get("weather_intro_file")
-                outro_file = config.get("weather_outro_file")
+                intro_file, outro_file = resolve_weather_sound_files(config)
                 await asyncio.to_thread(add_forecast_sounds, filename, intro_file, outro_file)
             play_err = await play_audio_file(vc, filename)
             if play_err:
                 await ctx.send(f"Forecast generated, but playback failed: {play_err}")
             else:
-                await ctx.send("🔊 Reading forecast in voice channel.")
+                if with_sounds:
+                    intro_name = os.path.basename(intro_file) if intro_file else "default tone"
+                    outro_name = os.path.basename(outro_file) if outro_file else "default tone"
+                    await ctx.send(f"🔊 Reading forecast in voice channel with sounds (intro: {intro_name}, outro: {outro_name}).")
+                else:
+                    await ctx.send("🔊 Reading forecast in voice channel.")
         else:
             await ctx.send(f"Forecast generated, but voice playback could not start: {err}")
     except Exception as e:
@@ -1223,7 +1293,10 @@ async def shutdown(ctx): await ctx.send("🛑 Closing..."); await bot.close()
 
 @bot.command()
 @configured_owner_only()
-async def restart(ctx): await ctx.send("🔄 Restarting..."); await bot.close(); os._exit(0)
+async def restart(ctx):
+    await ctx.send("🔄 Restarting...")
+    # Await directly so the relaunch path is guaranteed to run.
+    await restart_current_process()
 
 @bot.command()
 @configured_owner_only()
